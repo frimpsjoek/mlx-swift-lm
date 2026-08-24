@@ -604,12 +604,12 @@ private final class Gemma4TextAttention: Module {
     let useKEqV: Bool
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
     @ModuleInfo(key: "q_norm") var qNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift
-    @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale
+    @ModuleInfo(key: "k_norm") var kNorm: Gemma4RMSNormZeroShift?
+    @ModuleInfo(key: "v_norm") var vNorm: Gemma4RMSNormNoScale?
     @ModuleInfo var rope: OffsetLayer
 
     init(config: Gemma4TextConfiguration, layerIdx: Int) {
@@ -630,17 +630,22 @@ private final class Gemma4TextAttention: Module {
         self.isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
 
         self._qProj.wrappedValue = Linear(config.hiddenSize, numHeads * headDim, bias: false)
-        self._kProj.wrappedValue = Linear(config.hiddenSize, numKVHeads * headDim, bias: false)
-        if !useKEqV {
-            self._vProj.wrappedValue = Linear(
+        // KV-shared layers reuse K/V from an earlier layer and intentionally
+        // have no local K/V parameters in the MLX checkpoint.
+        if !isKVSharedLayer {
+            self._kProj.wrappedValue = Linear(
                 config.hiddenSize, numKVHeads * headDim, bias: false)
+            if !useKEqV {
+                self._vProj.wrappedValue = Linear(
+                    config.hiddenSize, numKVHeads * headDim, bias: false)
+            }
+            self._kNorm.wrappedValue = Gemma4RMSNormZeroShift(
+                dimensions: headDim, eps: config.rmsNormEps)
+            self._vNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
         }
         self._oProj.wrappedValue = Linear(numHeads * headDim, config.hiddenSize, bias: false)
         self._qNorm.wrappedValue = Gemma4RMSNormZeroShift(
             dimensions: headDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = Gemma4RMSNormZeroShift(
-            dimensions: headDim, eps: config.rmsNormEps)
-        self._vNorm.wrappedValue = Gemma4RMSNormNoScale(eps: config.rmsNormEps)
 
         let ropeKey = isSliding ? "sliding_attention" : "full_attention"
         let ropeConfig = config.ropeParameters[ropeKey]
@@ -674,6 +679,9 @@ private final class Gemma4TextAttention: Module {
             currentOffset = offset ?? 0
             kvState = sharedKV
         } else {
+            guard let kProj, let kNorm, let vNorm else {
+                fatalError("Gemma4 attention called without sharedKV on a KV-shared layer")
+            }
             currentOffset = cache?.offset ?? 0
             var keys = kProj(x).reshaped(batch, length, numKVHeads, headDim)
             var values =
@@ -1120,6 +1128,7 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
     }
 
     func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let firstKVSharedLayer = config.hiddenLayers - config.numKVSharedLayers
         var sanitized: [String: MLXArray] = [:]
         sanitized.reserveCapacity(weights.count + 1)
 
@@ -1138,6 +1147,22 @@ private final class Gemma4TextLanguageModel: Module, KVCacheDimensionProvider {
             {
                 let rest = String(newKey.dropFirst("language_model.".count))
                 newKey = "language_model.model.\(rest)"
+            }
+
+            // KV-shared text layers reuse K/V from an earlier layer and do
+            // not declare local k_proj/v_proj/k_norm modules. Some older
+            // checkpoints still contain these redundant tensors.
+            if firstKVSharedLayer > 0,
+                newKey.contains("language_model.model.layers."),
+                newKey.contains("self_attn.k_proj")
+                    || newKey.contains("self_attn.v_proj")
+                    || newKey.contains("self_attn.k_norm"),
+                let layersRange = newKey.range(of: "language_model.model.layers."),
+                let layerIndex = Int(
+                    newKey[layersRange.upperBound...].prefix { $0.isNumber }),
+                layerIndex >= firstKVSharedLayer
+            {
+                continue
             }
 
             if newKey.hasSuffix(".experts.down_proj") {

@@ -216,12 +216,12 @@ private class Gemma4Attention: Module {
     let scale: Float
 
     @ModuleInfo(key: "q_proj") var qProj: Linear
-    @ModuleInfo(key: "k_proj") var kProj: Linear
+    @ModuleInfo(key: "k_proj") var kProj: Linear?
     @ModuleInfo(key: "v_proj") var vProj: Linear?
     @ModuleInfo(key: "o_proj") var oProj: Linear
 
     @ModuleInfo(key: "q_norm") var qNorm: RMSNorm
-    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm
+    @ModuleInfo(key: "k_norm") var kNorm: RMSNorm?
     @ModuleInfo(key: "v_norm") var vNorm: RMSNormNoScale
 
     @ModuleInfo var rope: RoPELayer
@@ -250,14 +250,19 @@ private class Gemma4Attention: Module {
         self.scale = 1.0
 
         self._qProj.wrappedValue = Linear(dim, nHeads * effectiveHeadDim, bias: false)
-        self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
-        if !useKeqV {
-            self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+        let firstKVSharedLayer = config.numHiddenLayers - config.numKvSharedLayers
+        let isKVSharedLayer = layerIdx >= firstKVSharedLayer && firstKVSharedLayer > 0
+        if !isKVSharedLayer {
+            self._kProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+            if !useKeqV {
+                self._vProj.wrappedValue = Linear(dim, nKvHeads * effectiveHeadDim, bias: false)
+            }
+            self._kNorm.wrappedValue = RMSNorm(
+                dimensions: effectiveHeadDim, eps: config.rmsNormEps)
         }
         self._oProj.wrappedValue = Linear(nHeads * effectiveHeadDim, dim, bias: false)
 
         self._qNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
-        self._kNorm.wrappedValue = RMSNorm(dimensions: effectiveHeadDim, eps: config.rmsNormEps)
         self._vNorm.wrappedValue = RMSNormNoScale(eps: config.rmsNormEps)
 
         // RoPE: sliding uses default, full uses proportional with partial rotation
@@ -299,6 +304,9 @@ private class Gemma4Attention: Module {
             keys = sharedK
             values = sharedV
         } else {
+            guard let kProj, let kNorm else {
+                fatalError("Gemma4 attention called without sharedKV on a KV-shared layer")
+            }
             var k = kProj(x).reshaped(B, L, nKvHeads, effectiveHeadDim)
             k = kNorm(k)
             k = k.transposed(0, 2, 1, 3)
@@ -664,6 +672,7 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
     }
 
     public func sanitize(weights: [String: MLXArray]) -> [String: MLXArray] {
+        let firstKVSharedLayer = config.numHiddenLayers - config.numKvSharedLayers
         var sanitized = [String: MLXArray]()
         for (k, v) in weights {
             // Skip vision/audio/rotary weights
@@ -672,6 +681,17 @@ public class Gemma4TextModel: Module, LLMModel, KVCacheDimensionProvider {
                 || k.contains("input_min")
                 || k.contains("output_max")
                 || k.contains("output_min")
+            {
+                continue
+            }
+            if firstKVSharedLayer > 0,
+                k.contains("layers."),
+                k.contains("self_attn.k_proj")
+                    || k.contains("self_attn.v_proj")
+                    || k.contains("self_attn.k_norm"),
+                let layersRange = k.range(of: "layers."),
+                let layerIndex = Int(k[layersRange.upperBound...].prefix { $0.isNumber }),
+                layerIndex >= firstKVSharedLayer
             {
                 continue
             }
